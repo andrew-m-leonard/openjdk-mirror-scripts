@@ -478,20 +478,20 @@ fi
 
 # JDK11+ tag sorting:
 # We use sort and tail to choose the latest tag in case more than one refers the same commit.
-# Versions tags are formatted: jdk-V[.W[.X[.P]]]+B; with V, W, X, P, B being numeric.
-# Transform "-" to "." in tag so we can sort as: "jdk.V[.W[.X[.P]]]+B"
-# Transform "+" to ".0.+" during the sort so that .P (patch) is defaulted to "0" for those
-# that don't have one, and the trailing "." to terminate the 5th field from the +
+# Versions tags are formatted: jdk-V1[.V2[.V3[.V4[.V5[.V6[.V7]]]]]]+B (up to 7 version digits).
+# Transform "-" to "." in tag so we can sort as: "jdk.V1[.V2...]+B"
+# Pad with up to 6 zero fields (".0.0.0.0.0.0+") so single-digit versions (e.g. jdk-27)
+# align up to 7 version components across fields 2 to 8.
 # First, sort on build number (B):
 jdk11plus_tag_sort1="sort -t+ -k2,2n"
-# Second, (stable) sort on (V), (W), (X), (P): P(Patch) is optional and defaulted to "0"
-jdk11plus_tag_sort2="sort -t. -k2,2n -k3,3n -k4,4n -k5,5n"
+# Second, (stable) sort on V1 through V7 (fields 2 through 8):
+jdk11plus_tag_sort2="sort -t. -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n -k7,7n -k8,8n"
 # Ignore "..+0" branch fork point tags — these mark where the next version branched off master
 # and are not real builds. Build tags for the next version (e.g. jdk-21.0.15+1) only appear on
 # that new branch, never on master, so +0 is always the last visible tag for that version on
 # master. Including it would advance currentReleaseTag past any not-yet-tagged current-version
 # builds (e.g. jdk-21.0.14 GA), permanently locking them out of the merge loop.
-jdk11plus_sort_tags_cmd="grep -v _adopt | grep -v '\+0$' | sed 's/jdk-/jdk./g' | sed 's/+/.0.0+/g' | $jdk11plus_tag_sort1 | nl -n rz | $jdk11plus_tag_sort2 | sed 's/\.0\.0+/+/g' | cut -f2- | sed 's/jdk./jdk-/g'"
+jdk11plus_sort_tags_cmd="grep -v _adopt | grep -v '\+0$' | sed 's/jdk-/jdk./g' | sed 's/+/.0.0.0.0.0.0+/g' | $jdk11plus_tag_sort1 | nl -n rz | $jdk11plus_tag_sort2 | sed 's/\.0\.0\.0\.0\.0\.0+/+/g' | cut -f2- | sed 's/jdk./jdk-/g'"
 
 # JDK8 tag sorting:
 # We use sort and tail to choose the latest tag in case more than one refers the same commit.
