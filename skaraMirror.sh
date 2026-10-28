@@ -16,10 +16,12 @@
 set -euxo pipefail
 
 # Make sure we're in a valid dir as a workspace
+# MIRROR_WORKSPACE and MIRROR_PATCHES are optional overrides, used by the tests/ harness.
+# (WORKSPACE itself is not used as the override as Jenkins sets it for its own purposes.)
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-mkdir -p $SCRIPT_DIR/workspace
-WORKSPACE=$SCRIPT_DIR/workspace
-PATCHES=$SCRIPT_DIR/patches/
+WORKSPACE=${MIRROR_WORKSPACE:-$SCRIPT_DIR/workspace}
+mkdir -p "$WORKSPACE"
+PATCHES=${MIRROR_PATCHES:-$SCRIPT_DIR/patches}/
 
 # TODO generalise this for the non adoptium build farm case
 function checkArgs() {
@@ -131,10 +133,161 @@ function performMergeFromSkaraIntoGit() {
   git push origin "$BRANCH" --tags || exit 1
 }
 
+# Decide which upstream tags the current upstream branch ($BRANCH) is responsible for mirroring.
+# See TAG_MIRRORING_STRATEGY.md. Uses GITHUB_REPO, VERSION, BRANCH and SKARA_DEFAULT_BRANCH.
+# There is no repo or version specific logic here other than the jdk8u naming scheme:
+# the jdkNNu rules are derived from the repo name (VERSION) and the branch name only.
+#
+# Sets:
+#   BRANCH_CLASS  mainline | update | cspu | head-feature | unknown
+#   TAG_REGEX     extended regex (grep -E) that the build tags of this branch must match
+function classifyBranch() {
+  BRANCH_CLASS="unknown"
+  TAG_REGEX=""
+  local re ver verRe
+
+  if [[ "${VERSION}" == "8" ]]; then
+    # jdk8u: tags are jdk8uNNN-bBB. Mainline versions always end in 2 (502, 512, ...), and CSPU
+    # branches (openjdk8uNNN) never do. aarch32-port-jdk8u tags carry an extra -aarch32-<date>.
+    local suffix=""
+    if [[ "${GITHUB_REPO}" == "aarch32-port-jdk8u" ]]; then
+      suffix='-aarch32-[0-9]+'
+    fi
+    re='^openjdk8u([0-9]+)$'
+    if [[ "${BRANCH}" == "${SKARA_DEFAULT_BRANCH}" ]]; then
+      BRANCH_CLASS="mainline"
+      TAG_REGEX="^jdk8u[0-9]*2-b[0-9]+${suffix}\$"
+    elif [[ "${BRANCH}" =~ $re ]]; then
+      ver="${BASH_REMATCH[1]}"
+      if [[ "${ver}" == *2 ]]; then
+        BRANCH_CLASS="update"
+      else
+        BRANCH_CLASS="cspu"
+      fi
+      TAG_REGEX="^jdk8u${ver}-b[0-9]+${suffix}\$"
+    fi
+  elif [[ -n "${VERSION}" ]]; then
+    # jdkNNu: tags are jdk-NN.0.VV+BB on the default branch (exactly three version components),
+    # on a jdkNN.0.VV update branch, or on a jdkNN.0.VV.x[.y...] CSPU / sub-update branch.
+    if [[ "${BRANCH}" == "${SKARA_DEFAULT_BRANCH}" ]]; then
+      BRANCH_CLASS="mainline"
+      TAG_REGEX="^jdk-${VERSION}\\.0\\.[0-9]+\\+[0-9]+\$"
+    else
+      re="^jdk${VERSION}\\.0\\.[0-9]+\$"
+      if [[ "${BRANCH}" =~ $re ]]; then
+        BRANCH_CLASS="update"
+      else
+        re="^jdk${VERSION}\\.0\\.[0-9]+(\\.[0-9]+)+\$"
+        if [[ "${BRANCH}" =~ $re ]]; then
+          BRANCH_CLASS="cspu"
+        fi
+      fi
+      if [[ "${BRANCH_CLASS}" != "unknown" ]]; then
+        # jdk27.0.1.0.2 -> ^jdk-27\.0\.1\.0\.2\+[0-9]+$
+        verRe=$(printf '%s' "${BRANCH#jdk}" | sed 's/\./\\./g')
+        TAG_REGEX="^jdk-${verRe}\\+[0-9]+\$"
+      fi
+    fi
+  else
+    # jdk (head): tags are jdk-NN+BB on the default branch and on the jdkNN feature branches
+    re='^jdk([0-9]+)$'
+    if [[ "${BRANCH}" == "${SKARA_DEFAULT_BRANCH}" ]]; then
+      BRANCH_CLASS="mainline"
+      TAG_REGEX="^jdk-[0-9]+\\+[0-9]+\$"
+    elif [[ "${BRANCH}" =~ $re ]]; then
+      BRANCH_CLASS="head-feature"
+      TAG_REGEX="^jdk-${BASH_REMATCH[1]}\\+[0-9]+\$"
+    fi
+  fi
+}
+
+# Print the name of the mirror release branch that is the partner of the current release branch
+# for the given build tag, or nothing if the current branch has no partner. See the "Paired
+# branches" section of TAG_MIRRORING_STRATEGY.md. The partner is derived from the branch class
+# and the tag shape only, there are no hard coded repos or versions:
+#   jdk (head)    master <-> jdkMM          for jdk-MM+BB
+#   jdkMMu        master <-> jdkMM.0.VV     for jdk-MM.0.VV+BB
+#   jdk8u         master <-> openjdk8uNN2   for jdk8uNN2-bBB (aarch32 adds -aarch32-<date>)
+# CSPU and sub-update branches have no partner.
+function partnerReleaseBranch() {
+  local tag="$1" re
+  case "${BRANCH_CLASS}" in
+    update|head-feature)
+      # a versioned branch is partnered with the default branch's release branch
+      echo "release"
+      ;;
+    mainline)
+      if [[ "${VERSION}" == "8" ]]; then
+        re='^jdk8u([0-9]+)-b[0-9]+'
+        if [[ "$tag" =~ $re ]]; then
+          echo "release_openjdk8u${BASH_REMATCH[1]}"
+        fi
+      elif [[ -n "${VERSION}" ]]; then
+        re='^jdk-([0-9]+\.0\.[0-9]+)\+[0-9]+$'
+        if [[ "$tag" =~ $re ]]; then
+          echo "release_jdk${BASH_REMATCH[1]}"
+        fi
+      else
+        re='^jdk-([0-9]+)\+[0-9]+$'
+        if [[ "$tag" =~ $re ]]; then
+          echo "release_jdk${BASH_REMATCH[1]}"
+        fi
+      fi
+      ;;
+  esac
+}
+
+# Create the <tag>_adopt tag on the current release branch, and set ADOPT_TAG_CREATED.
+# _adopt tagging is strict: if <tag>_adopt already exists the job fails, because it means the
+# branch tag filters overlap. The one exception is the partner rule: the existing tag is
+# accepted if it lives on the partner's release branch (origin/<partner>) and not on the
+# current release branch. In that case the tag is not created again and the job continues.
+# dev and dev_* branches are never consulted, they contain release and would always match.
+function tagAdopt() {
+  local tag="$1" message="$2"
+  local adoptTag="${tag}_adopt"
+  local partner
+
+  ADOPT_TAG_CREATED=false
+  if [ -z "$(git tag -l "$adoptTag")" ]; then
+    git tag -a "$adoptTag" -m "$message" || exit 1
+    ADOPT_TAG_CREATED=true
+    return 0
+  fi
+
+  partner=$(partnerReleaseBranch "$tag")
+  if [[ -n "$partner" ]] \
+     && git rev-parse -q --verify "refs/remotes/origin/$partner" > /dev/null \
+     && git merge-base --is-ancestor "refs/tags/$adoptTag" "refs/remotes/origin/$partner" \
+     && ! git merge-base --is-ancestor "refs/tags/$adoptTag" "$RELEASE_BRANCH" ; then
+    echo "Adopt tag ${adoptTag} already exists on partner branch origin/${partner}, not tagging it again on $RELEASE_BRANCH"
+    return 0
+  fi
+
+  echo "ERROR: ${adoptTag} already exists but is not on this branch's partner (${partner:-none}), so the branch tag filters overlap"
+  echo "Branches containing ${adoptTag}:"
+  git branch -r --contains "refs/tags/$adoptTag" || true
+  exit 1
+}
+
+
+# List the sorted (oldest first) build tags this branch is responsible for that are merged into
+# the given ref. Prints nothing, and succeeds, if there are none: callers must check for that.
+# (The filters below return 1 on empty input, which must not kill the job under pipefail.)
+function listBuildTags() {
+  git tag --merged "$1" | { grep -E "$TAG_REGEX" || true; } | { eval "$jdk_sort_tags_cmd" || true; }
+}
+
 # Merge master(New tagged builds only) into release branch as we build
 # off release branch at the Adoptium JDK Build farm for release builds
 # release branch contains patches that Adoptium JDK has beyond upstream OpenJDK tagged builds
 function performMergeIntoReleaseFromMaster() {
+
+  if [[ "${BRANCH_CLASS}" == "unknown" ]]; then
+    echo "WARNING: upstream branch '$BRANCH' does not match any known branch naming pattern, so no release or dev branch is maintained for it"
+    SKIP_RELEASE_AND_DEV=true
+    return 0
+  fi
 
   # Abort existing merge
   git merge --abort || true
@@ -143,13 +296,17 @@ function performMergeIntoReleaseFromMaster() {
   # Fetch latest and get latest master build tag
   git fetch --all --tags
 
-  buildTags=$(git tag --merged origin/"$BRANCH" $TAG_SEARCH || exit 1)
-  sortedBuildTags=$(echo "$buildTags" | eval "$jdk_sort_tags_cmd" || exit 1)
+  sortedBuildTags=$(listBuildTags origin/"$BRANCH")
+  if [[ -z "$sortedBuildTags" ]]; then
+    echo "No eligible build tags (matching $TAG_REGEX) on origin/$BRANCH yet, skipping release and dev branches for it"
+    SKIP_RELEASE_AND_DEV=true
+    return 0
+  fi
 
   NEW_RELEASE_BRANCH_TAG=""
   if ! git checkout -f "$RELEASE_BRANCH" ; then
     if ! git rev-parse -q --verify "origin/$RELEASE_BRANCH" ; then
-      currentBuildTag=$(echo "$buildTags" | eval "$jdk_sort_tags_cmd" | tail -1 || exit 1)
+      currentBuildTag=$(echo "$sortedBuildTags" | tail -1)
       git checkout -b "$RELEASE_BRANCH" $currentBuildTag || exit 1
       # Remember the tag this new branch was created from so we can _adopt tag it after patching
       NEW_RELEASE_BRANCH_TAG="$currentBuildTag"
@@ -239,21 +396,15 @@ function performMergeIntoReleaseFromMaster() {
     # If this is a brand new release branch, tag the base build tag with _adopt now that
     # patches have been applied — the merge loop below will find no new tags to process
     if [[ -n "$NEW_RELEASE_BRANCH_TAG" ]]; then
-      local adoptTag="${NEW_RELEASE_BRANCH_TAG}_adopt"
-      if [ "$(git tag -l "$adoptTag")" == "" ]; then
-        echo "Tagging new $RELEASE_BRANCH base tag ${adoptTag}"
-        git tag -a "$adoptTag" -m "Merged ${NEW_RELEASE_BRANCH_TAG} into $RELEASE_BRANCH" || exit 1
-      else
-        echo "Adopt tag ${adoptTag} already exists, skipping"
-      fi
+      echo "Tagging new $RELEASE_BRANCH base tag ${NEW_RELEASE_BRANCH_TAG}_adopt"
+      tagAdopt "$NEW_RELEASE_BRANCH_TAG" "Merged ${NEW_RELEASE_BRANCH_TAG} into $RELEASE_BRANCH"
     fi
   else
     echo "README.JAVASE already exists — patches already applied, skipping"
   fi
 
   # Find the latest release tag that is not in releaseTagExcludeList
-  releaseTags=$(git tag --merged "$RELEASE_BRANCH" $TAG_SEARCH || exit 1)
-  sortedReleaseTags=$(echo "$releaseTags" | eval "$jdk_sort_tags_cmd" || exit 1)
+  sortedReleaseTags=$(listBuildTags "$RELEASE_BRANCH")
   currentReleaseTag=""
   for tag in $sortedReleaseTags; do
     skipThisTag=false
@@ -303,8 +454,10 @@ function performMergeIntoReleaseFromMaster() {
             exit 1
           fi
         fi
-        git tag -a "${tag}_adopt" -m "Merged $tag into $RELEASE_BRANCH" || exit 1
-        newAdoptTags="${newAdoptTags} ${tag}_adopt"
+        tagAdopt "$tag" "Merged $tag into $RELEASE_BRANCH"
+        if [[ "$ADOPT_TAG_CREATED" == true ]]; then
+          newAdoptTags="${newAdoptTags} ${tag}_adopt"
+        fi
       fi
     fi
   done
@@ -314,8 +467,7 @@ function performMergeIntoReleaseFromMaster() {
   fi
 
   # Find the latest and previous release tags that is not in releaseTagExcludeList
-  releaseTags=$(git tag --merged "$RELEASE_BRANCH" $TAG_SEARCH || exit 1)
-  sortedReleaseTags=$(echo "$releaseTags" | eval "$jdk_sort_tags_cmd" || exit 1)
+  sortedReleaseTags=$(listBuildTags "$RELEASE_BRANCH")
   prevReleaseTag=""
   currentReleaseTag=""
   for tag in $sortedReleaseTags; do
@@ -367,6 +519,11 @@ function performMergeIntoReleaseFromMaster() {
 # dev contains patches that Adoptium JDK has beyond upstream OpenJDK
 function performMergeIntoDevFromMaster() {
 
+  if [[ "${SKIP_RELEASE_AND_DEV}" == true ]]; then
+    echo "Skipping dev branch for $BRANCH"
+    return 0
+  fi
+
   # Abort existing merge
   git merge --abort || true
   git reset --hard || true
@@ -392,8 +549,7 @@ function performMergeIntoDevFromMaster() {
     fi
   fi
 
-  devTags=$(git tag --merged "$DEV_BRANCH" $TAG_SEARCH || exit 1)
-  currentDevTag=$(echo "$devTags" | eval "$jdk_sort_tags_cmd" | tail -1 || exit 1)
+  currentDevTag=$(listBuildTags "$DEV_BRANCH" | tail -1)
   echo "Current $DEV_BRANCH build tag: $currentDevTag"
 
   # Merge master "HEAD"
@@ -421,19 +577,26 @@ function performMergeIntoDevFromMaster() {
     git --no-pager log --oneline "origin/$DEV_BRANCH..$DEV_BRANCH"
   fi
 
-  devTags=$(git tag --merged "$DEV_BRANCH" $TAG_SEARCH || exit 1)
-  currentDevTag=$(echo "$devTags" | eval "$jdk_sort_tags_cmd" | tail -1 || exit 1)
+  currentDevTag=$(listBuildTags "$DEV_BRANCH" | tail -1)
   echo "New $DEV_BRANCH build tag: $currentDevTag"
 
   git push origin "$DEV_BRANCH" || exit 1
 }
+
+# When sourced (for example by the tests/ harness) only define the functions above
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  return 0
+fi
 
 checkArgs $#
 
 GITHUB_REPO="$1"
 
 # alpine-jdk8u mirrors from the upstream jdk8u Skara repo
-if [[ "${GITHUB_REPO}" == "alpine-jdk8u" ]]; then
+# SKARA_REPO_URL is an optional override of the upstream repo location, used by the tests/ harness
+if [[ -n "${SKARA_REPO_URL:-}" ]]; then
+  SKARA_REPO="${SKARA_REPO_URL}"
+elif [[ "${GITHUB_REPO}" == "alpine-jdk8u" ]]; then
   SKARA_REPO="https://github.com/openjdk/jdk8u"
 else
   SKARA_REPO="https://github.com/openjdk/${GITHUB_REPO}"
@@ -467,14 +630,10 @@ fi
 GITHUB_REPO_REMOVE_aarch32=${GITHUB_REPO#"aarch32"}
 VERSION=${GITHUB_REPO_REMOVE_aarch32//[!0-9]/}
 # Regex expands aarch32-jdk8u as 328
-if [[ "${VERSION}" == "8" ]]; then
-  TAG_SEARCH="jdk${VERSION}*-*"
-elif [[ -n "${VERSION}" ]]; then
-  TAG_SEARCH="jdk-${VERSION}*+*"
-else
-  # jdk(head) repo tag sort finds latest tag for this repo & branch, note jdk(head) contains multiple versions
-  TAG_SEARCH="jdk-*+*"
-fi
+# Which tags a branch mirrors is decided by classifyBranch (see TAG_MIRRORING_STRATEGY.md)
+SKIP_RELEASE_AND_DEV=false
+classifyBranch
+echo "Upstream branch $BRANCH is class '$BRANCH_CLASS', tag filter: ${TAG_REGEX:-<none>}"
 
 # JDK11+ tag sorting:
 # We use sort and tail to choose the latest tag in case more than one refers the same commit.
@@ -491,7 +650,7 @@ jdk11plus_tag_sort2="sort -t. -k2,2n -k3,3n -k4,4n -k5,5n -k6,6n -k7,7n -k8,8n"
 # that new branch, never on master, so +0 is always the last visible tag for that version on
 # master. Including it would advance currentReleaseTag past any not-yet-tagged current-version
 # builds (e.g. jdk-21.0.14 GA), permanently locking them out of the merge loop.
-jdk11plus_sort_tags_cmd="grep -v _adopt | grep -v '\+0$' | sed 's/jdk-/jdk./g' | sed 's/+/.0.0.0.0.0.0+/g' | $jdk11plus_tag_sort1 | nl -n rz | $jdk11plus_tag_sort2 | sed 's/\.0\.0\.0\.0\.0\.0+/+/g' | cut -f2- | sed 's/jdk./jdk-/g'"
+jdk11plus_sort_tags_cmd="grep -v _adopt | grep -v -- '-ga$' | grep -v '\+0$' | sed 's/jdk-/jdk./g' | sed 's/+/.0.0.0.0.0.0+/g' | $jdk11plus_tag_sort1 | nl -n rz | $jdk11plus_tag_sort2 | sed 's/\.0\.0\.0\.0\.0\.0+/+/g' | cut -f2- | sed 's/jdk./jdk-/g'"
 
 # JDK8 tag sorting:
 # We use sort and tail to choose the latest tag in case more than one refers the same commit.
@@ -502,7 +661,7 @@ jdk8_tag_sort1="sort -tb -k2,2n"
 jdk8_tag_sort2="sort -tu -k2,2n"
 # Ignore "..-b00" branch fork point tags (same reasoning as jdk11+ above).
 # Note: no "$" anchor — aarch32 tags embed -b00 mid-string, e.g. jdk8u504-b00-aarch32-20260731.
-jdk8_sort_tags_cmd="grep -v _adopt | grep -v '\-b00' | $jdk8_tag_sort1 | nl -n rz | $jdk8_tag_sort2  | cut -f2-"
+jdk8_sort_tags_cmd="grep -v _adopt | grep -v -- '-ga$' | grep -v '\-b00' | $jdk8_tag_sort1 | nl -n rz | $jdk8_tag_sort2  | cut -f2-"
 
 
 if [[ "${VERSION}" == "8" ]]; then

@@ -31,6 +31,14 @@ flowchart TD
 
 ```
 
+# Which upstream tags each branch mirrors
+
+Each upstream branch mirrors only its own build tags, and `master` is always mirrored last. This avoids the same upstream tag being `_adopt` tagged twice (for example `jdk-27.0.1+9`, tagged on `jdk27.0.1`, which is later merged into `master`). The one allowed duplicate is a `master` and versioned-branch partner pair, where the existing `_adopt` tag is accepted if it is on the partner's release branch. See [TAG_MIRRORING_STRATEGY.md](TAG_MIRRORING_STRATEGY.md) for the rules, and `skaraMirror.sh` for the implementation (`classifyBranch`, `listBuildTags`, `tagAdopt`).
+
+# Tests
+
+`tests/run.sh` runs the mirror scenarios in `tests/scenarios/` against synthetic local git repositories, with no network access. It also runs on pull requests (`.github/workflows/mirror-script-tests.yml`). To add a scenario, copy an existing file in `tests/scenarios/` and see `tests/lib.sh` for the helpers.
+
 # Release trigger scripts and process
 
 - triggerReleasePipeline.sh runs by Jenkins job build-scripts/utils/releaseTrigger_jdkXXu and only run by scheduler "H * 10-25 1,3,4,7,9,10 *"
