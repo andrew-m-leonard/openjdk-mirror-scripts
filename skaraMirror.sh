@@ -81,6 +81,17 @@ function cloneGitHubRepo() {
   # If we don't have a $GITHUB_REPO locally then clone it from adoptium/$GITHUB_REPO.git
   if [ ! -d "$GITHUB_REPO" ] ; then
     git clone "$REPO" "$GITHUB_REPO" || exit 1
+  else
+    # A workspace left over from a previous run may have been cloned from a different repo (for
+    # example the real adoptium repo when this run is for a fork). Everything after this fetches
+    # from and pushes to its origin, so never carry on with an origin that is not $REPO.
+    local existingOrigin
+    existingOrigin=$(git -C "$GITHUB_REPO" remote get-url origin 2>/dev/null) || existingOrigin=""
+    if [[ "$existingOrigin" != "$REPO" ]]; then
+      echo "ERROR: existing workspace $WORKSPACE/$GITHUB_REPO has origin '${existingOrigin:-<none>}' but this job is mirroring to '$REPO'"
+      echo "Delete $WORKSPACE/$GITHUB_REPO (or run the job with CLEAN_MIRROR_WORKSPACE) and run it again"
+      exit 1
+    fi
   fi
 }
 
